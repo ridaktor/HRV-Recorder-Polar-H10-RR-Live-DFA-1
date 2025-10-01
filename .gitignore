@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -205,3 +206,44 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+=======
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+*.log
+
+# Virtual envs
+.venv/
+venv/
+ENV/
+env/
+.python-version
+
+# Coverage / testing / typing
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Data logs (keep folder, ignore large CSV output)
+data/*.csv
+data/*.log
+!data/.gitkeep
+>>>>>>> 397e19f (Initial commit: Polar H10 RR logger with live DFA α1 (FatMaxxer-style) + adaptive window + plots)
