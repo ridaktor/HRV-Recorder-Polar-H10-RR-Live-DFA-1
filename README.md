@@ -1,12 +1,9 @@
-<<<<<<< HEAD
-# HRV-Recorder-Polar-H10-RR-Live-DFA-1
-=======
 # HRV Recorder (Polar H10) — RR + Live DFA α1
 
 Small Python tool to log RR intervals from a Polar H10 over BLE and (optionally) compute **DFA α1** live, FatMaxxer-style.  
 Includes live plots for **HR**, **RR**, and **DFA α1** with color-coded zones and optional **adaptive window** sizing.
 
-https://github.com/yourname/hrv-recorder (replace with your repo)
+https://github.com/ridaktor/HRV-Recorder-Polar-H10-RR-Live-DFA-1
 
 ---
 
