@@ -233,6 +233,8 @@ async def main():
 
     ap = argparse.ArgumentParser(description="Log RR from Polar H10 to CSV (+ live HR/RR/α1 plots, FatMaxxer-style)")
 
+    ap.add_argument("--gate_hr_slope_bpm_min", type=float, default=2.0,
+                    help="Skip α1 if |dHR/dt| in window exceeds this (bpm per minute)")
     ap.add_argument("--minutes", type=float, default=0, help="Duration (0 = until Ctrl+C)")
     ap.add_argument("--out", default="", help="RR CSV (default: data/HRV_<timestamp>.csv)")
     ap.add_argument("--alpha_out", default="", help="Alpha CSV (default: data/HRV_<timestamp>_alpha.csv)")
@@ -247,6 +249,8 @@ async def main():
     ap.add_argument("--alpha_min_beats", type=int, default=60, help="Minimum beats in window to compute α1")
     ap.add_argument("--artifact_mode", choices=["auto","5","15","25"], default="auto",
                     help="Jump threshold: 5%%, 15%%, 25%% or auto (HR>90->5%%, HR<85->25%%, else 15%%)")
+    ap.add_argument("--artifact_max_pct", type=float, default=0.10,
+                    help="Skip α1 if > this fraction of beats are jumps >20% (0.0–1.0)")
 
     ap.add_argument("--alpha_adaptive", action="store_true",
                     help="Enable adaptive α1 window (aims for target beats).")
@@ -315,19 +319,31 @@ async def main():
     alpha_times: Deque[float] = deque(maxlen=1000)
     alpha_vals:  Deque[float] = deque(maxlen=1000)
 
+    last_beat_time = [None]  # mutable cell for closure
+
     # BLE callback
     def callback(_: int, data: bytearray):
         rr_list, hr = parse_rr_intervals(bytes(data))
-        now = datetime.now(timezone.utc)
-        ts_iso = now.isoformat()
-        unix_ms = int(now.timestamp() * 1000)
+
+        # capture a single HR sample for display (packet-level)
         if hr is not None:
             hr_disp_buf.append(float(hr))
-        t_now = now.timestamp()
+
+        # build beat-by-beat timestamps by accumulating RR
         for rr_ms in rr_list:
+            if last_beat_time[0] is None:
+                bt = datetime.now(timezone.utc)
+            else:
+                bt = last_beat_time[0] + timedelta(milliseconds=float(rr_ms))
+            last_beat_time[0] = bt
+
+            # log one row per beat with its own timestamp
+            ts_iso = bt.isoformat()
+            unix_ms = int(bt.timestamp() * 1000)
+
             rows.append([ts_iso, unix_ms, rr_ms, hr])
             rr_buf.append(float(rr_ms))
-            t_buf.append(t_now)
+            t_buf.append(bt.timestamp())  # POSIX seconds per beat
 
     # Plot setup
     if args.plot:
@@ -407,57 +423,95 @@ async def main():
                 if (last_alpha_compute is None) or ((now - last_alpha_compute).total_seconds() >= args.alpha_step_s):
                     last_alpha_compute = now
 
+                    # Need at least some data and minimum beats
                     if len(t_buf) > 0 and len(rr_buf) >= args.alpha_min_beats:
-                        # Choose effective window seconds
-                        if args.alpha_adaptive:
+
+                        # --- choose effective window seconds (fixed or adaptive) ---
+                        if getattr(args, "alpha_adaptive", False):
                             rr_tail_for_hr = np.array(list(rr_buf)[-max(args.alpha_min_beats, 60):], float)
-                            eff_window_s = _choose_adaptive_window_s(rr_tail_for_hr,
-                                                                     args.alpha_target_beats,
-                                                                     args.alpha_window_min_s,
-                                                                     args.alpha_window_max_s)
+                            eff_window_s = _choose_adaptive_window_s(
+                                rr_tail_for_hr,
+                                getattr(args, "alpha_target_beats", 100),
+                                getattr(args, "alpha_window_min_s", 45),
+                                getattr(args, "alpha_window_max_s", 180),
+                            )
                             if eff_window_s is None:
                                 eff_window_s = float(args.alpha_window_s)
                         else:
                             eff_window_s = float(args.alpha_window_s)
 
-                        t_last = t_buf[-1]
+                        # --- build window mask using beat-aligned timestamps ---
+                        t_last = float(t_buf[-1])  # POSIX seconds
                         t_start = t_last - eff_window_s
+                        tt = np.array(list(t_buf), float)  # per-beat POSIX
+                        rr_all = np.array(list(rr_buf), float)  # per-beat RR (ms)
 
-                        tt = np.array(list(t_buf), float)
-                        rr = np.array(list(rr_buf), float)
                         mask = tt >= t_start
-                        rr_win = rr[mask]
+                        if not np.any(mask):
+                            continue
 
-                        if rr_win.size >= args.alpha_min_beats:
-                            # mean HR in window for AUTO artifact rule
-                            mean_rr = float(np.nanmean(rr_win)) if rr_win.size else np.nan
-                            hr_mean = 60000.0 / mean_rr if np.isfinite(mean_rr) and mean_rr > 0 else 0.0
-                            if args.artifact_mode == "auto":
-                                thr = _artifact_threshold_auto(hr_mean)
-                            elif args.artifact_mode == "5":
-                                thr = 0.05
-                            elif args.artifact_mode == "15":
-                                thr = 0.15
-                            else:
-                                thr = 0.25
+                        rr_win = rr_all[mask]
+                        t_win = tt[mask]
 
-                            rr_clean, art_frac = _drop_artifacts_rr(rr_win, thr)
-                            a1 = dfa_alpha1_fmx(rr_clean)
+                        # still need enough beats pre-clean
+                        if rr_win.size < args.alpha_min_beats:
+                            continue
 
-                            if np.isfinite(a1):
-                                alpha_times.append(now.timestamp() - t0)
-                                alpha_vals.append(a1)
-                                if w_a:
-                                    w_a.writerow([
-                                        now.isoformat(),
-                                        int(now.timestamp()*1000),
-                                        f"{a1:.4f}",
-                                        int(rr_clean.size),
-                                        f"{int(thr*100)}%",
-                                        f"{art_frac:.3f}",
-                                        f"{eff_window_s:.1f}",
-                                    ])
-                                    f_a.flush()
+                        # --- derive instant HR from RR for slope estimate (bpm) ---
+                        hr_win = 60000.0 / np.maximum(rr_win, 1e-6)
+                        x = t_win - t_win.mean()
+                        y = hr_win - hr_win.mean()
+                        denom = float((x * x).sum())
+                        hr_slope_bpm_per_min = 60.0 * float((x * y).sum() / denom) if denom > 0 else 0.0
+
+                        # thresholds (safe defaults if CLI flags weren’t added)
+                        gate_hr_slope_bpm_min = float(getattr(args, "gate_hr_slope_bpm_min", 2.0))
+                        artifact_max_pct = float(getattr(args, "artifact_max_pct", 0.10))
+
+                        # --- artifact jump threshold selection (FatMaxxer-like) ---
+                        mean_rr = float(np.nanmean(rr_win))
+                        hr_mean = 60000.0 / mean_rr if np.isfinite(mean_rr) and mean_rr > 0 else 0.0
+                        if args.artifact_mode == "auto":
+                            thr = _artifact_threshold_auto(hr_mean)  # 5% / 15% / 25% depending on HR
+                        elif args.artifact_mode == "5":
+                            thr = 0.05
+                        elif args.artifact_mode == "15":
+                            thr = 0.15
+                        else:  # "25"
+                            thr = 0.25
+
+                        # --- clean RR + compute artifact fraction in this window ---
+                        rr_clean, art_frac = _drop_artifacts_rr(rr_win, thr)
+                        if art_frac > args.artifact_max_pct:
+                            print(f"Skip α1: artifact {art_frac:.2f} > {args.artifact_max_pct:.2f}")
+                            continue
+
+                        # gating: steady-state + acceptable noise + enough beats AFTER cleaning
+                        if (abs(hr_slope_bpm_per_min) > gate_hr_slope_bpm_min) or \
+                                (art_frac > artifact_max_pct) or \
+                                (rr_clean.size < args.alpha_min_beats):
+                            # Optional debug:
+                            print(f"Skip α1: slope={hr_slope_bpm_per_min:.1f} bpm/min, "
+                                  f"art={art_frac:.2f}, beats={rr_clean.size}")
+                            continue
+
+                        # --- compute DFA α1 (short-term 4..16 beats) ---
+                        a1 = dfa_alpha1_fmx(rr_clean)
+
+                        if np.isfinite(a1):
+                            alpha_times.append(now.timestamp() - t0)  # seconds since script start
+                            alpha_vals.append(a1)
+                            if w_a:
+                                w_a.writerow([
+                                    now.isoformat(),
+                                    int(now.timestamp() * 1000),
+                                    f"{a1:.4f}",
+                                    int(rr_clean.size),
+                                    f"{int(thr * 100)}%",
+                                    f"{art_frac:.3f}",
+                                    f"{eff_window_s:.1f}",
+                                ])
+                                f_a.flush()
 
             # Live plots
             if args.plot:
