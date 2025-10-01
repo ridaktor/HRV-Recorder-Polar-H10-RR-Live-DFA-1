@@ -58,7 +58,7 @@ async def _discover_normalized(timeout: float):
     try:
         res = await BleakScanner.discover(timeout=timeout, return_adv=True)  # type: ignore[arg-type]
         items = []
-        if isinstance(res, dict):  # macOS CoreBluetooth sometimes returns a dict
+        if isinstance(res, dict):  # CoreBluetooth may return a dict
             for k, v in res.items():
                 dev = None; name = None; uuids = []
                 if hasattr(k, "address"):  # BLEDevice as key
@@ -231,10 +231,9 @@ async def main():
             pass
     import matplotlib.pyplot as plt
 
-    ap = argparse.ArgumentParser(description="Log RR from Polar H10 to CSV (+ live HR/RR/α1 plots, FatMaxxer-style)")
+    ap = argparse.ArgumentParser(description="Log RR from Polar H10 to CSV (+ live HR/RR/α1, robust gating)")
 
-    ap.add_argument("--gate_hr_slope_bpm_min", type=float, default=2.0,
-                    help="Skip α1 if |dHR/dt| in window exceeds this (bpm per minute)")
+    # Session + IO
     ap.add_argument("--minutes", type=float, default=0, help="Duration (0 = until Ctrl+C)")
     ap.add_argument("--out", default="", help="RR CSV (default: data/HRV_<timestamp>.csv)")
     ap.add_argument("--alpha_out", default="", help="Alpha CSV (default: data/HRV_<timestamp>_alpha.csv)")
@@ -242,20 +241,25 @@ async def main():
     ap.add_argument("--address", default="", help="Direct device UUID/address (macOS)")
     ap.add_argument("--plot", action="store_true", help="Show live plots")
 
-    # FatMaxxer + adaptive options
-    ap.add_argument("--alpha", action="store_true", help="Compute & plot DFA α1 live (FatMaxxer style)")
-    ap.add_argument("--alpha_window_s", type=int, default=120, help="Fixed window length for α1 (seconds) [FMX=120]")
-    ap.add_argument("--alpha_step_s",   type=int, default=20,  help="Recompute α1 every N seconds [FMX=20]")
-    ap.add_argument("--alpha_min_beats", type=int, default=60, help="Minimum beats in window to compute α1")
-    ap.add_argument("--artifact_mode", choices=["auto","5","15","25"], default="auto",
-                    help="Jump threshold: 5%%, 15%%, 25%% or auto (HR>90->5%%, HR<85->25%%, else 15%%)")
-    ap.add_argument("--artifact_max_pct", type=float, default=0.10,
-                    help="Skip α1 if > this fraction of beats are jumps >20% (0.0–1.0)")
+    # DFA options
+    ap.add_argument("--alpha", action="store_true", help="Compute & plot DFA α1 live")
+    ap.add_argument("--alpha_window_s", type=int, default=120, help="Fixed α1 window (seconds)")
+    ap.add_argument("--alpha_step_s",   type=int, default=20,  help="Recompute α1 every N seconds")
+    ap.add_argument("--alpha_min_beats", type=int, default=60, help="Minimum beats in window for α1")
 
+    # Artifact + ramp gates
+    ap.add_argument("--artifact_mode", choices=["auto","5","15","25"], default="auto",
+                    help="Jump threshold: 5%%, 15%%, 25%% or auto (HR>90→5%%, HR<85→25%%, else 15%%)")
+    ap.add_argument("--artifact_max_pct", type=float, default=0.10,
+                    help="Skip α1 if > this fraction of beats are >20%% RR jumps (0.0–1.0)")
+    ap.add_argument("--gate_hr_slope_bpm_min", type=float, default=2.0,
+                    help="Skip α1 when |dHR/dt| in window exceeds this (bpm/min)")
+
+    # Adaptive window
     ap.add_argument("--alpha_adaptive", action="store_true",
-                    help="Enable adaptive α1 window (aims for target beats).")
+                    help="Enable adaptive α1 window (targets beats rather than seconds).")
     ap.add_argument("--alpha_target_beats", type=int, default=100,
-                    help="Target beats per α1 window when adaptive is enabled.")
+                    help="Target beats for α1 when adaptive is enabled.")
     ap.add_argument("--alpha_window_min_s", type=int, default=45,
                     help="Minimum window seconds for adaptive α1.")
     ap.add_argument("--alpha_window_max_s", type=int, default=180,
@@ -269,14 +273,10 @@ async def main():
     data_dir.mkdir(parents=True, exist_ok=True)
 
     ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # If user passed --out/--alpha_out, respect it; otherwise use data/
     out_path = Path(args.out.strip()) if args.out.strip() else (data_dir / f"HRV_{ts_tag}.csv")
-    alpha_path = (
-        Path(args.alpha_out.strip()) if args.alpha_out.strip() else (data_dir / f"HRV_{ts_tag}_alpha.csv")
-    ) if args.alpha else None
+    alpha_path = (Path(args.alpha_out.strip()) if args.alpha_out.strip()
+                  else (data_dir / f"HRV_{ts_tag}_alpha.csv")) if args.alpha else None
 
-    # Ensure parent dirs exist even for custom paths
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if alpha_path:
         alpha_path.parent.mkdir(parents=True, exist_ok=True)
@@ -294,7 +294,7 @@ async def main():
             sys.exit(1)
         target = dev
 
-    # CSVs
+    # CSV writers
     f_rr = out_path.open("w", newline="")
     w_rr = csv.writer(f_rr)
     w_rr.writerow(["timestamp_utc", "unix_ms", "rr_ms", "hr_bpm"])
@@ -310,26 +310,30 @@ async def main():
         f_a = None; w_a = None
 
     # Buffers (beat-aligned)
-    rows: List[List[object]] = []
-    last_flushed = 0
     rr_buf: Deque[float] = deque(maxlen=20000)      # RR (ms)
     t_buf:  Deque[float] = deque(maxlen=20000)      # POSIX seconds for each beat
-    hr_disp_buf: Deque[float] = deque(maxlen=20000) # HR for plotting (full session)
+    hr_disp_buf: Deque[float] = deque(maxlen=20000) # HR display stream
 
-    alpha_times: Deque[float] = deque(maxlen=1000)
+    alpha_times: Deque[float] = deque(maxlen=1000)  # seconds since start
     alpha_vals:  Deque[float] = deque(maxlen=1000)
 
-    last_beat_time = [None]  # mutable cell for closure
+    beats_saved = 0
+    last_beat_time = [None]  # mutable cell for per-beat time accumulation
 
-    # BLE callback
+    # BLE callback (write beats directly to CSV to avoid memory growth)
     def callback(_: int, data: bytearray):
+        nonlocal beats_saved
         rr_list, hr = parse_rr_intervals(bytes(data))
 
-        # capture a single HR sample for display (packet-level)
-        if hr is not None:
+        # Update display HR: prefer beat-derived median if we got beats; else packet HR
+        if rr_list:
+            rr_for_hr = np.array(rr_list[-5:], float)
+            if rr_for_hr.size > 0 and np.all(np.isfinite(rr_for_hr)):
+                hr_disp_buf.append(60000.0 / float(np.median(rr_for_hr)))
+        elif hr is not None:
             hr_disp_buf.append(float(hr))
 
-        # build beat-by-beat timestamps by accumulating RR
+        # Beat-by-beat timestamps (accumulate RR)
         for rr_ms in rr_list:
             if last_beat_time[0] is None:
                 bt = datetime.now(timezone.utc)
@@ -337,13 +341,16 @@ async def main():
                 bt = last_beat_time[0] + timedelta(milliseconds=float(rr_ms))
             last_beat_time[0] = bt
 
-            # log one row per beat with its own timestamp
             ts_iso = bt.isoformat()
             unix_ms = int(bt.timestamp() * 1000)
 
-            rows.append([ts_iso, unix_ms, rr_ms, hr])
+            # Write immediately (memory-safe)
+            w_rr.writerow([ts_iso, unix_ms, rr_ms, hr])
+            beats_saved += 1
+
+            # Update buffers for analysis/plots
             rr_buf.append(float(rr_ms))
-            t_buf.append(bt.timestamp())  # POSIX seconds per beat
+            t_buf.append(bt.timestamp())
 
     # Plot setup
     if args.plot:
@@ -358,31 +365,32 @@ async def main():
         hr_line, = ax1.plot([], [], lw=1.5, color="tab:blue")
         rr_line, = ax2.plot([], [], lw=1.0, color="tab:orange")
 
-        # Readout boxes (top-left)
+        # Readouts
         hr_txt = ax1.text(0.01, 0.95, "", transform=ax1.transAxes, va="top",
                           bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.85))
         rr_txt = ax2.text(0.01, 0.95, "", transform=ax2.transAxes, va="top",
                           bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.85))
 
-        # Axes labels/grids
+        # Labels/grids
         ax1.set_ylabel("HR (bpm)"); ax1.grid(True, alpha=0.3)
         ax2.set_ylabel("RR (ms)");  ax2.set_xlabel("Samples"); ax2.grid(True, alpha=0.3)
 
         if args.alpha:
-            # α1 zones
+            # Zones
             ax3.axhspan(0.75, 2.0, facecolor="blue",   alpha=0.08, zorder=0)
             ax3.axhspan(0.50, 0.75, facecolor="yellow", alpha=0.15, zorder=0)
             ax3.axhspan(0.00, 0.50, facecolor="red",    alpha=0.12, zorder=0)
             ax3.axhline(0.75, linestyle="--", linewidth=1, color="red")
             ax3.axhline(0.50, linestyle="--", linewidth=1, color="red")
+
             a_line, = ax3.plot([], [], lw=1.8, color="red", zorder=5)
             ax3.set_ylim(0.2, 1.6)
             ax3.set_ylabel("DFA α1"); ax3.set_xlabel("Time (s)"); ax3.grid(True, alpha=0.3)
-            # live α1 readout (box color follows zone)
+
             a_txt = ax3.text(0.01, 0.95, "", transform=ax3.transAxes, va="top",
                              bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.85))
 
-    # Connect with fallback if address became stale on macOS
+    # Connect (with fallback if address became stale on macOS)
     client = BleakClient(target)
     try:
         try:
@@ -411,11 +419,8 @@ async def main():
             await asyncio.sleep(1)
             elapsed += 1
 
-            # Flush new rows -> RR CSV
-            if len(rows) > last_flushed:
-                w_rr.writerows(rows[last_flushed:])
-                f_rr.flush()
-                last_flushed = len(rows)
+            # Keep RR file on disk up to date
+            f_rr.flush()
 
             # α1 (fixed or adaptive) every alpha_step_s
             if args.alpha:
@@ -423,7 +428,7 @@ async def main():
                 if (last_alpha_compute is None) or ((now - last_alpha_compute).total_seconds() >= args.alpha_step_s):
                     last_alpha_compute = now
 
-                    # Need at least some data and minimum beats
+                    # Need some data and minimum beats
                     if len(t_buf) > 0 and len(rr_buf) >= args.alpha_min_beats:
 
                         # --- choose effective window seconds (fixed or adaptive) ---
@@ -443,8 +448,8 @@ async def main():
                         # --- build window mask using beat-aligned timestamps ---
                         t_last = float(t_buf[-1])  # POSIX seconds
                         t_start = t_last - eff_window_s
-                        tt = np.array(list(t_buf), float)  # per-beat POSIX
-                        rr_all = np.array(list(rr_buf), float)  # per-beat RR (ms)
+                        tt = np.array(list(t_buf), float)
+                        rr_all = np.array(list(rr_buf), float)
 
                         mask = tt >= t_start
                         if not np.any(mask):
@@ -457,22 +462,22 @@ async def main():
                         if rr_win.size < args.alpha_min_beats:
                             continue
 
-                        # --- derive instant HR from RR for slope estimate (bpm) ---
+                        # --- derive instant HR from RR for slope estimate (bpm/min) ---
                         hr_win = 60000.0 / np.maximum(rr_win, 1e-6)
                         x = t_win - t_win.mean()
                         y = hr_win - hr_win.mean()
                         denom = float((x * x).sum())
                         hr_slope_bpm_per_min = 60.0 * float((x * y).sum() / denom) if denom > 0 else 0.0
 
-                        # thresholds (safe defaults if CLI flags weren’t added)
+                        # thresholds
                         gate_hr_slope_bpm_min = float(getattr(args, "gate_hr_slope_bpm_min", 2.0))
-                        artifact_max_pct = float(getattr(args, "artifact_max_pct", 0.10))
+                        artifact_max_pct      = float(getattr(args, "artifact_max_pct", 0.10))
 
                         # --- artifact jump threshold selection (FatMaxxer-like) ---
                         mean_rr = float(np.nanmean(rr_win))
                         hr_mean = 60000.0 / mean_rr if np.isfinite(mean_rr) and mean_rr > 0 else 0.0
                         if args.artifact_mode == "auto":
-                            thr = _artifact_threshold_auto(hr_mean)  # 5% / 15% / 25% depending on HR
+                            thr = _artifact_threshold_auto(hr_mean)  # 5/15/25% depending on HR
                         elif args.artifact_mode == "5":
                             thr = 0.05
                         elif args.artifact_mode == "15":
@@ -482,46 +487,41 @@ async def main():
 
                         # --- clean RR + compute artifact fraction in this window ---
                         rr_clean, art_frac = _drop_artifacts_rr(rr_win, thr)
-                        if art_frac > args.artifact_max_pct:
-                            print(f"Skip α1: artifact {art_frac:.2f} > {args.artifact_max_pct:.2f}")
-                            continue
 
                         # gating: steady-state + acceptable noise + enough beats AFTER cleaning
                         if (abs(hr_slope_bpm_per_min) > gate_hr_slope_bpm_min) or \
-                                (art_frac > artifact_max_pct) or \
-                                (rr_clean.size < args.alpha_min_beats):
+                           (art_frac > artifact_max_pct) or \
+                           (rr_clean.size < args.alpha_min_beats):
                             # Optional debug:
-                            print(f"Skip α1: slope={hr_slope_bpm_per_min:.1f} bpm/min, "
-                                  f"art={art_frac:.2f}, beats={rr_clean.size}")
-                            continue
-
-                        # --- compute DFA α1 (short-term 4..16 beats) ---
-                        a1 = dfa_alpha1_fmx(rr_clean)
-
-                        if np.isfinite(a1):
-                            alpha_times.append(now.timestamp() - t0)  # seconds since script start
-                            alpha_vals.append(a1)
-                            if w_a:
-                                w_a.writerow([
-                                    now.isoformat(),
-                                    int(now.timestamp() * 1000),
-                                    f"{a1:.4f}",
-                                    int(rr_clean.size),
-                                    f"{int(thr * 100)}%",
-                                    f"{art_frac:.3f}",
-                                    f"{eff_window_s:.1f}",
-                                ])
-                                f_a.flush()
+                            # print(f"Skip α1: slope={hr_slope_bpm_per_min:.1f}, art={art_frac:.2f}, beats={rr_clean.size}")
+                            pass
+                        else:
+                            # --- compute DFA α1 (short-term 4..16 beats) ---
+                            a1 = dfa_alpha1_fmx(rr_clean)
+                            if np.isfinite(a1):
+                                alpha_times.append(now.timestamp() - t0)  # seconds since start
+                                alpha_vals.append(a1)
+                                if w_a:
+                                    w_a.writerow([
+                                        now.isoformat(),
+                                        int(now.timestamp() * 1000),
+                                        f"{a1:.4f}",
+                                        int(rr_clean.size),
+                                        f"{int(thr * 100)}%",
+                                        f"{art_frac:.3f}",
+                                        f"{eff_window_s:.1f}",
+                                    ])
+                                    f_a.flush()
 
             # Live plots
             if args.plot:
                 # HR — plot ALL samples, set limits, show current value
                 if len(hr_disp_buf) > 0:
                     y = np.fromiter(hr_disp_buf, dtype=float)
-                    x = np.arange(y.size)
-                    hr_line.set_data(x, y)
+                    x_arr = np.arange(y.size)
+                    hr_line.set_data(x_arr, y)
 
-                    ax1.set_xlim(0, max(50, x[-1]))
+                    ax1.set_xlim(0, max(50, int(x_arr[-1])))
                     y_min = float(np.nanmin(y)); y_max = float(np.nanmax(y))
                     pad = max(3.0, 0.05 * max(1.0, y_max - y_min))
                     ax1.set_ylim(y_min - pad, y_max + pad)
@@ -535,7 +535,7 @@ async def main():
                     x2 = np.arange(y2.size)
                     rr_line.set_data(x2, y2)
 
-                    ax2.set_xlim(0, max(50, x2[-1]))
+                    ax2.set_xlim(0, max(50, int(x2[-1])))
                     y2_min = float(np.nanmin(y2)); y2_max = float(np.nanmax(y2))
                     pad2 = max(10.0, 0.05 * max(1.0, y2_max - y2_min))
                     ax2.set_ylim(y2_min - pad2, y2_max + pad2)
@@ -561,7 +561,9 @@ async def main():
                     else:
                         patch.set_facecolor("red");    patch.set_alpha(0.20)
 
-                    ax3.relim(); ax3.autoscale_view()
+                    # keep fixed y-limits; autoscale only X
+                    ax3.relim()
+                    ax3.autoscale_view(scalex=True, scaley=False)
 
                 try:
                     fig.canvas.draw_idle()
@@ -573,7 +575,7 @@ async def main():
                 break
 
             if elapsed % 10 == 0:
-                print(f"… {elapsed}s, beats saved: {last_flushed}, alpha points: {len(alpha_vals)}")
+                print(f"… {elapsed}s, beats saved: {beats_saved}, alpha points: {len(alpha_vals)}")
 
     except KeyboardInterrupt:
         print("\nStopping (Ctrl+C). Writing remaining data…")
@@ -588,8 +590,6 @@ async def main():
             pass
 
         # Final flushes
-        if len(rows) > last_flushed:
-            w_rr.writerows(rows[last_flushed:])
         f_rr.flush(); f_rr.close()
         if alpha_path:
             f_a.flush(); f_a.close()
