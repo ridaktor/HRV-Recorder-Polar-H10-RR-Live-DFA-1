@@ -1,10 +1,10 @@
-# hrv_recorder/ble.py
 from typing import List, Optional, Tuple, Union
 
 from bleak import BleakScanner
 
 HR_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"
 HR_CHAR_UUID    = "00002a37-0000-1000-8000-00805f9b34fb"
+
 
 def parse_rr_intervals(data: bytes) -> Tuple[List[float], Optional[int]]:
     """Parse BLE Heart Rate Measurement (0x2A37) -> ([RR_ms...], HR_bpm or None)."""
@@ -35,7 +35,6 @@ def parse_rr_intervals(data: bytes) -> Tuple[List[float], Optional[int]]:
 async def find_device(name_hint: Optional[str] = "polar", timeout: float = 12.0) -> Optional[Union[str, "BLEDevice"]]:
     """
     Return the first BLE device whose name contains name_hint or advertises the HR service.
-    Works across OSes with Bleak.
     """
     nh = (name_hint or "").lower()
     devices = await BleakScanner.discover(timeout=timeout)

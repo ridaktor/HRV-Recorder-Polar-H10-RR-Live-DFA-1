@@ -1,6 +1,6 @@
-# hrv_recorder/dfa.py
-from typing import Tuple
+from typing import Tuple, Optional
 import numpy as np
+
 
 def artifact_threshold_auto(hr_mean_bpm: float) -> float:
     """FatMaxxer-like jump threshold: >90 bpm -> 5%; <85 bpm -> 25%; else 15%."""
@@ -9,6 +9,7 @@ def artifact_threshold_auto(hr_mean_bpm: float) -> float:
     if hr_mean_bpm < 85.0:
         return 0.25
     return 0.15
+
 
 def pick_threshold(mode: str, hr_mean_bpm: float) -> float:
     if mode == "auto":
@@ -20,6 +21,7 @@ def pick_threshold(mode: str, hr_mean_bpm: float) -> float:
     if mode == "25":
         return 0.25
     return artifact_threshold_auto(hr_mean_bpm)
+
 
 def drop_artifacts(rr_ms: np.ndarray, thr: float) -> Tuple[np.ndarray, float, np.ndarray]:
     """
@@ -43,6 +45,7 @@ def drop_artifacts(rr_ms: np.ndarray, thr: float) -> Tuple[np.ndarray, float, np
     rr_f = rr[keep]
     art_frac = 1.0 - (rr_f.size / max(n, 1))
     return rr_f, float(art_frac), keep
+
 
 def dfa_alpha1_short(rr_ms_window: np.ndarray) -> float:
     """
@@ -80,3 +83,24 @@ def dfa_alpha1_short(rr_ms_window: np.ndarray) -> float:
         return np.nan
     lx = np.log10(Ns[good]); ly = np.log10(Fs[good])
     return float(np.polyfit(lx, ly, 1)[0])
+
+
+def choose_adaptive_window_s(
+    rr_tail_ms: np.ndarray,
+    target_beats: int = 60,
+    min_s: int = 18,
+    max_s: int = 60
+) -> Optional[float]:
+    """
+    Choose window (seconds) so it roughly contains target_beats, based on recent mean RR.
+    Returns None if insufficient data.
+    """
+    rr = np.asarray(rr_tail_ms, float)
+    rr = rr[(rr > 300) & (rr < 2200)]
+    if rr.size < max(10, int(0.25 * target_beats)):
+        return None
+    mean_rr_ms = float(np.nanmean(rr))
+    if not np.isfinite(mean_rr_ms) or mean_rr_ms <= 0:
+        return None
+    window_s = (target_beats * mean_rr_ms) / 1000.0
+    return float(np.clip(window_s, min_s, max_s))

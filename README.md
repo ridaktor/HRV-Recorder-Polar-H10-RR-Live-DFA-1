@@ -1,36 +1,23 @@
 # HRV Recorder (Polar H10) — RR + Live DFA α1
 
-Simple Python tool to log **RR intervals** from a Polar H10 over BLE and compute short-term **DFA α1** live (FatMaxxer-style).
+Small Python tool to log RR intervals from a Polar H10 over BLE and compute **DFA α1** live with three ready-to-use modes.  
+Includes rolling 10-minute plots for **HR**, **RR**, and **DFA α1** with color-coded zones.
 
-- Beat-accurate RR logging (one row per beat)
-- DFA α1 on short-term scales **4–16 beats** (beat domain), window **120 s**, step **20 s**
-- Simple artifact rule (auto **5/15/25%** RR-jump threshold based on mean HR)
-- Minimal live plots for **HR**, **RR**, and **α1**
-- CSV outputs in `./data/`
+---
+
+## Modes
+
+- **conservative** — classic FatMaxxer style (120 s window, step 20 s). Smoother, robust; optional ramp/artifact gating.
+- **quick** — beat-synchronous α1 (e.g., 60-beat window, update every beat). Very low latency for intervals/Tabata.
+- **adaptive** — time window auto-sizes to ~60 beats (18–60 s), step 2 s. Faster response at high HR.
+
+You can override any preset with explicit flags.
+
+---
 
 ## Install
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate    # Windows: .venv\Scripts\activate
-pip install -r requirements.txt 
-```
-
-## Run
-
-```bash
-python hrv.py --plot --alpha
-
-#Options:
---minutes M                 Duration (0 = until Ctrl+C). Default: 0
---out PATH                  RR CSV (default: data/HRV_<timestamp>.csv)
---alpha_out PATH            α1 CSV (default: data/HRV_<timestamp>_alpha.csv)
---device NAME               Substring of device name (e.g., "Polar")
---address ADDR              Direct address/UUID (macOS)
-
---plot                      Show live plots
---alpha                     Compute DFA α1 live (4–16 beats)
---alpha_window_s S          α1 window seconds (default: 120)
---alpha_step_s S            Recompute every S seconds (default: 20)
---alpha_min_beats N         Minimum beats to compute α1 (default: 60)
---artifact_mode MODE        "auto" | "5" | "15" | "25" (RR jump threshold)
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt

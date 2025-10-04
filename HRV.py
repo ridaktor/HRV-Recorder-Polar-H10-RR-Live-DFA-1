@@ -1,4 +1,3 @@
-# hrv.py
 import asyncio
 from hrv_recorder.recorder import run
 
