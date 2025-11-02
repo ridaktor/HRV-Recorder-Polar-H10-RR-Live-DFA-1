@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import math
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -13,7 +14,13 @@ from bleak import BleakClient
 from bleak.exc import BleakDeviceNotFoundError
 
 from .ble import HR_CHAR_UUID, parse_rr_intervals, find_device
-from .dfa import compute_dfa_alpha1, DFA_N_MIN_DEFAULT, DFA_N_MAX_DEFAULT
+# Try to import DFA defaults; fall back if your dfa.py doesn't export them.
+try:
+    from .dfa import compute_dfa_alpha1, DFA_N_MIN_DEFAULT, DFA_N_MAX_DEFAULT
+except Exception:  # noqa: BLE001
+    from .dfa import compute_dfa_alpha1  # type: ignore
+    DFA_N_MIN_DEFAULT, DFA_N_MAX_DEFAULT = 4, 12
+
 from .plotting import LivePlotter
 
 
@@ -61,7 +68,15 @@ def add_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--alpha_step_beats", type=int, default=1,
                     help="Recompute α1 every N beats")
     ap.add_argument("--alpha_smooth_pts", type=int, default=3,
-                    help="Moving-average points for plotted α1 (plot only)")
+                    help="Simple moving-average points for plotted α1 (legacy, plot only)")
+
+    # Experimental fast smoothing for quick mode
+    ap.add_argument("--alpha_fast_smooth", action="store_true",
+                    help="EXPERIMENTAL (quick mode): median→EMA smoothing for per-beat α1")
+    ap.add_argument("--alpha_fast_med_s", type=float, default=15.0,
+                    help="Rolling median window (seconds) for fast smoothing (quick mode)")
+    ap.add_argument("--alpha_fast_ema_tau_s", type=float, default=20.0,
+                    help="EMA time constant (seconds) for fast smoothing (quick mode)")
 
     # --- DFA scale config (default tuned to match FatMaxxer alpha1v2) ---
     ap.add_argument("--dfa_nmax", type=int, default=DFA_N_MAX_DEFAULT,
@@ -121,6 +136,7 @@ def _print_effective_config(args):
         "alpha_adaptive","alpha_target_beats","alpha_window_min_s","alpha_window_max_s",
         "alpha_window_beats","alpha_step_beats","alpha_smooth_pts",
         "artifact_mode","alpha_ramp_gate","alpha_artifact_max_pct",
+        "alpha_fast_smooth","alpha_fast_med_s","alpha_fast_ema_tau_s",
         "dfa_nmax",
     ]
     for k in show:
@@ -168,6 +184,14 @@ def _hr_ramp_bpm_per_min(rr_ms: np.ndarray, ts_s: np.ndarray) -> float:
     return 60.0 * abs(slope_bps)            # bpm per minute
 
 
+def _compute_alpha1(rr_ms: np.ndarray, mode: str, n_max: int, hr_for_auto: float | None = None) -> tuple[float, float]:
+    """Call compute_dfa_alpha1 with n_max if supported; fallback otherwise."""
+    try:
+        return compute_dfa_alpha1(rr_ms, mode=mode, hr_for_auto=hr_for_auto, n_max=int(n_max))  # type: ignore[arg-type]
+    except TypeError:
+        return compute_dfa_alpha1(rr_ms, mode=mode, hr_for_auto=hr_for_auto)  # type: ignore[misc]
+
+
 # ---------- Runner ----------
 async def run():
     ap = add_args(argparse.ArgumentParser(description="Polar H10 RR logger + DFA α1 (FatMaxxer-style)"))
@@ -212,12 +236,15 @@ async def run():
     if alpha_path:
         f_a = alpha_path.open("w", newline="")
         w_a = csv.writer(f_a)
-        w_a.writerow([
-            "timestamp_utc", "unix_ms", "alpha1", "beats_used",
-            "artifact_threshold", "artifact_fraction", "window_s_or_beats"
-        ])
+        # Header optionally contains alpha1_smooth for quick mode + fast smoothing
+        header = ["timestamp_utc", "unix_ms", "alpha1"]
+        if getattr(args, "alpha_follow_rr", False) and getattr(args, "alpha_fast_smooth", False):
+            header.append("alpha1_smooth")
+        header += ["beats_used", "artifact_threshold", "artifact_fraction", "window_s_or_beats"]
+        w_a.writerow(header)
     else:
-        f_a = None; w_a = None
+        f_a = None
+        w_a = None
 
     # --- buffers
     rr_buf: Deque[float] = deque(maxlen=20000)  # per-beat RR (ms)
@@ -227,8 +254,13 @@ async def run():
 
     # α1 traces
     alpha_times: Deque[float] = deque(maxlen=10000)     # seconds since start
-    alpha_vals:  Deque[float] = deque(maxlen=10000)     # used by time-based mode OR smoothed quick mode
-    alpha_vals_raw:  Deque[float] = deque(maxlen=10000) # raw quick mode (for CSV + optional diagnostics)
+    alpha_vals:  Deque[float] = deque(maxlen=10000)     # time-based or smoothed quick mode (for plotting)
+    alpha_vals_raw:  Deque[float] = deque(maxlen=10000) # raw quick mode (for smoothing/CSV)
+
+    # Experimental fast smoothing state (quick mode)
+    alpha_fast_buf: Deque[tuple[float, float]] = deque(maxlen=2000)  # (t_rel, alpha_raw)
+    alpha_fast_ema_val = [None]   # type: list[float | None]
+    alpha_fast_last_t  = [None]   # type: list[float | None]
 
     beats_saved = 0
     last_beat_time = [None]        # mutable for closure
@@ -244,7 +276,7 @@ async def run():
     t0 = datetime.now(timezone.utc).timestamp()
 
     def _smooth_for_plot(y: Deque[float], k: int) -> float:
-        """Return last value or small moving average (plot only)."""
+        """Return last value or small moving average (legacy plot-only)."""
         if k <= 1 or len(y) < 2:
             return y[-1]
         n = min(k, len(y))
@@ -299,30 +331,60 @@ async def run():
                         mean_rr = float(np.nanmean(rr_val)) if rr_val.size else np.nan
                         hr_mean = 60000.0 / mean_rr if np.isfinite(mean_rr) and mean_rr > 0 else 0.0
 
-                        a1, art_frac = compute_dfa_alpha1(
+                        a1, art_frac = _compute_alpha1(
                             rr_tail,
                             mode=args.artifact_mode,
                             n_max=int(args.dfa_nmax),
                         )
-                        if np.isfinite(a1):
+
+                        # enforce artifact cap if requested
+                        cap_ok = (args.alpha_artifact_max_pct >= 1.0) or (art_frac <= args.alpha_artifact_max_pct)
+                        if np.isfinite(a1) and cap_ok:
                             t_rel = bt.timestamp() - t0
                             alpha_times.append(t_rel)
                             alpha_vals_raw.append(a1)
 
-                            # smooth for plotting only
-                            a1_plot = _smooth_for_plot(alpha_vals_raw, int(args.alpha_smooth_pts))
+                            # --- Experimental fast smoothing (median -> EMA) ---
+                            if args.alpha_fast_smooth:
+                                # keep only last alpha_fast_med_s seconds
+                                alpha_fast_buf.append((t_rel, float(a1)))
+                                cutoff = t_rel - float(args.alpha_fast_med_s)
+                                while alpha_fast_buf and alpha_fast_buf[0][0] < cutoff:
+                                    alpha_fast_buf.popleft()
+                                # median of recent window
+                                med_val = float(np.median([v for _, v in alpha_fast_buf])) if alpha_fast_buf else float(a1)
+                                # EMA with time-aware coefficient
+                                if alpha_fast_ema_val[0] is None:
+                                    alpha_fast_ema_val[0] = med_val
+                                    alpha_fast_last_t[0]  = t_rel
+                                else:
+                                    dt = max(0.0, t_rel - float(alpha_fast_last_t[0] or t_rel))
+                                    tau = max(1e-3, float(args.alpha_fast_ema_tau_s))
+                                    coeff = 1.0 - math.exp(-dt / tau)
+                                    alpha_fast_ema_val[0] = float(alpha_fast_ema_val[0] + coeff * (med_val - alpha_fast_ema_val[0]))
+                                    alpha_fast_last_t[0]  = t_rel
+                                a1_plot = float(alpha_fast_ema_val[0])
+                            else:
+                                # legacy small moving average (plot only)
+                                a1_plot = _smooth_for_plot(alpha_vals_raw, int(args.alpha_smooth_pts))
+
                             alpha_vals.append(a1_plot)
 
                             if w_a:
-                                w_a.writerow([
+                                row = [
                                     ts_iso,
                                     unix_ms,
                                     f"{a1:.4f}",
+                                ]
+                                if args.alpha_fast_smooth:
+                                    row.append(f"{a1_plot:.4f}")  # alpha1_smooth
+                                row += [
                                     int(rr_tail.size),  # beats in tail (pre-filter)
                                     _thr_str_for_logging(args.artifact_mode, hr_mean),
                                     f"{art_frac:.3f}",
                                     f"{K}b*",          # per-beat mode (computed from tail)
-                                ])
+                                ]
+                                w_a.writerow(row)
 
     # --- connect + loop
     client = BleakClient(target)
@@ -394,7 +456,7 @@ async def run():
                                 hr_slope_bpm_per_min = _hr_ramp_bpm_per_min(rr_win, t_win)
 
                                 # compute α1 + artifact fraction
-                                a1, art_frac = compute_dfa_alpha1(
+                                a1, art_frac = _compute_alpha1(
                                     rr_win, mode=args.artifact_mode, n_max=int(args.dfa_nmax)
                                 )
 
